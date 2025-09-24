@@ -10,6 +10,7 @@ on:
   pull_request_review:
     types: [submitted]
 
+# 顶层权限（写权限必需）
 permissions:
   contents: write
   pull-requests: write
@@ -19,12 +20,15 @@ permissions:
 
 jobs:
   claude:
+    # 触发条件：含 @claude 的评论 / review 评论 / PR review / issue 标题或正文
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
+
+    # job 级权限（冗余但清晰）
     permissions:
       contents: write
       pull-requests: write
@@ -33,6 +37,19 @@ jobs:
       id-token: write
 
     steps:
+      # 0)（可选）检查 Secret 是否存在 —— 只检查“是否为空”，不打印内容
+      - name: Sanity check secrets
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "ERROR: ANTHROPIC_API_KEY is empty/missing"
+            exit 1
+          else
+            echo "ANTHROPIC_API_KEY is present"
+          fi
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # 1) 用 PAT 检出（保证 git 有写权限）
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -40,17 +57,19 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GH_PAT }}
 
+      # 2) 设定 git 身份（用于后续提交）
       - name: Configure git user
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # 3) 运行 Claude Code（显式指定模型；用 PAT 作为 GitHub token；用 ANTHROPIC_API_KEY 调用官方 API）
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@beta   # 若仍异常可临时改为 @main 测试
         with:
-          # ✅ 改成你的 PAT（写入权限充足）
           github_token: ${{ secrets.GH_PAT }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: "claude-3-5-sonnet-20240620"  # 显式指定一个稳定可用的模型
           additional_permissions: |
             actions: read
