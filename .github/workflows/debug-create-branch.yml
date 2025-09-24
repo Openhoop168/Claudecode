@@ -1,0 +1,36 @@
+name: Debug Create Branch
+on:
+  workflow_dispatch:
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo with PAT
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push debug branch
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          BR=debug/${{ github.run_id }}
+          echo "creating $BR"
+          git checkout -b "$BR"
+          echo "$(date)" > .debug_${{ github.run_id }}.txt
+          git add .
+          git commit -m "debug: add marker for $BR"
+          # 使用 PAT 推送（与 checkout token 保持一致）
+          git push https://${{ github.actor }}:${GH_PAT}@github.com/${{ github.repository }} "$BR"
+          echo "Pushed $BR"
