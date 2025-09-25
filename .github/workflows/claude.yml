@@ -10,7 +10,7 @@ on:
   pull_request_review:
     types: [submitted]
 
-# 顶层权限（写权限必需）
+# 1) 顶层权限：确保 GITHUB_TOKEN 至少具有写权限（我们仍然用 GH_PAT 推送）
 permissions:
   contents: write
   pull-requests: write
@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   claude:
-    # 含 @claude 的评论 / review 评论 / PR review / issue 标题或正文
+    # 只在包含触发词时运行
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -28,7 +28,6 @@ jobs:
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
 
-    # job 级权限（冗余但清晰）
     permissions:
       contents: write
       pull-requests: write
@@ -37,7 +36,7 @@ jobs:
       id-token: write
 
     steps:
-      # 1) 用 PAT 检出代码，确保后续能创建分支、提交、推送
+      # 2) 使用可写的 GH_PAT 进行 checkout（关键）
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -45,13 +44,13 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GH_PAT }}
 
-      # 2) 配置 git 身份
+      # 3) 配置 Git 身份（推分支需要）
       - name: Configure git user
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # 3) 先验证 Anthropic API Key 是否可用（必须返回 HTTP 200 才继续）
+      # 4) 验证 Anthropic API Key 是否返回 200（不通就直接 fail）
       - name: Verify Anthropic API key works
         env:
           KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -65,38 +64,64 @@ jobs:
           echo "HTTP $CODE"
           test "$CODE" = "200"
 
-      # 4) 运行 Claude Code（显式指定模型；使用 GH_PAT 和 ANTHROPIC_API_KEY）
+      # 5) 列出账号可用模型，并按优先级选择第一个可用的；将结果输出给后续步骤
+      - name: Choose available Anthropic model automatically
+        id: choose_model
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -e
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+
+          echo "Listing models from Anthropic..."
+          RAW=$(curl -s \
+            -H "x-api-key: $KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            https://api.anthropic.com/v1/models)
+          echo "$RAW" | jq -r '.'
+
+          # 可按需调整优先级顺序（从新到旧，越靠前越优先）
+          PREFERRED=(
+            "claude-sonnet-4-20250514"
+            "claude-opus-4-20250514"
+            "claude-3-7-sonnet-20250219"
+            "claude-3-5-sonnet-20240620"
+            "claude-3-5-sonnet-latest"
+          )
+
+          # 把可用模型名拍平成纯列表
+          AVAILABLE=$(echo "$RAW" | jq -r '.data[].id' 2>/dev/null || true)
+
+          CHOSEN=""
+          for m in "${PREFERRED[@]}"; do
+            if echo "$AVAILABLE" | grep -qx "$m"; then
+              CHOSEN="$m"
+              break
+            fi
+          done
+
+          if [ -z "$CHOSEN" ]; then
+            echo "❌ No preferred models found in your account."
+            echo "Available models were:"
+            echo "$AVAILABLE"
+            exit 1
+          fi
+
+          echo "✅ Selected model: $CHOSEN"
+          echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
+
+      # 6) 运行 Claude Code（显式传入：写入用 GH_PAT；模型用上一步选出的；并保持最小附加权限）
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@beta
         with:
           github_token: ${{ secrets.GH_PAT }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-
-          # 显式指定模型（你账号一定有 quota 的版本）
-          model: "claude-3-5-sonnet-20240620"
-
-          # 允许 Claude 使用这些工具（写文件 + git 全流程）
-          allowed_tools: |
-            Write(*)
-            Edit(*)
-            Bash(git status)
-            Bash(git add -A)
-            Bash(git commit -m *)
-            Bash(git push origin *)
-            Bash(ls -la)
-            Bash(pwd)
-
-          # 给它多一点交互和时间
-          max_turns: 20
-          timeout_minutes: 20
-
-          # 读取 CI 结果（保留）
+          model: "${{ steps.choose_model.outputs.model }}"
           additional_permissions: |
             actions: read
-
-          # 触发设置（保留）
+          # 下面三项可按需保留/调整，你当前用 issue 触发，保持一致即可
           trigger_phrase: "@claude"
           label_trigger: "claude"
           branch_prefix: "claude/"
-          mode: tag
