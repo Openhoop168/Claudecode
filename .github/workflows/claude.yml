@@ -72,14 +72,64 @@ jobs:
             -H "anthropic-version: 2023-06-01" \
             | jq .
 
-      # 4) 运行 Claude Code
+# 4) 列出账号可用模型，并按优先级选择第一个可用的；将结果输出给后续步骤
+      - name: Choose available Anthropic model automatically
+        id: choose_model
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -e
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y jq >/dev/null
+
+          echo "Listing models from Anthropic..."
+          RAW=$(curl -s \
+            -H "x-api-key: $KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            https://api.anthropic.com/v1/models)
+          echo "$RAW" | jq -r '.'
+
+          # 可按需调整优先级顺序（从新到旧，越靠前越优先）
+          PREFERRED=(
+            "claude-sonnet-4-20250514"
+            "claude-opus-4-20250514"
+            "claude-3-7-sonnet-20250219"
+            "claude-3-5-sonnet-20240620"
+            "claude-3-5-sonnet-latest"
+          )
+
+          # 把可用模型名拍平成纯列表
+          AVAILABLE=$(echo "$RAW" | jq -r '.data[].id' 2>/dev/null || true)
+
+          CHOSEN=""
+          for m in "${PREFERRED[@]}"; do
+            if echo "$AVAILABLE" | grep -qx "$m"; then
+              CHOSEN="$m"
+              break
+            fi
+          done
+
+          if [ -z "$CHOSEN" ]; then
+            echo "❌ No preferred models found in your account."
+            echo "Available models were:"
+            echo "$AVAILABLE"
+            exit 1
+          fi
+
+          echo "✅ Selected model: $CHOSEN"
+          echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
+
+      # 5) 运行 Claude Code（显式传入：写入用 GH_PAT；模型用上一步选出的；并保持最小附加权限）
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@beta
         with:
           github_token: ${{ secrets.GH_PAT }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # 自动选择模型（避免写死不可用的）
-          model: claude-3-5-sonnet-latest
+          model: "${{ steps.choose_model.outputs.model }}"
           additional_permissions: |
             actions: read
+          # 下面三项可按需保留/调整，你当前用 issue 触发，保持一致即可
+          trigger_phrase: "@claude"
+          label_trigger: "claude"
+          branch_prefix: "claude/"
