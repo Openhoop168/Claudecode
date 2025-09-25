@@ -72,6 +72,31 @@ jobs:
         with:
           github_token: ${{ secrets.GH_PAT }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          # 显式指定模型（你账号一定有 quota 的版本）
           model: "claude-3-5-sonnet-20240620"
+
+          # 允许 Claude 使用这些工具（写文件 + git 全流程）
+          allowed_tools: |
+            Write(*)
+            Edit(*)
+            Bash(git status)
+            Bash(git add -A)
+            Bash(git commit -m *)
+            Bash(git push origin *)
+            Bash(ls -la)
+            Bash(pwd)
+
+          # 给它多一点交互和时间
+          max_turns: 20
+          timeout_minutes: 20
+
+          # 读取 CI 结果（保留）
           additional_permissions: |
             actions: read
+
+          # 触发设置（保留）
+          trigger_phrase: "@claude"
+          label_trigger: "claude"
+          branch_prefix: "claude/"
+          mode: tag
