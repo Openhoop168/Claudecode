@@ -10,7 +10,7 @@ on:
   pull_request_review:
     types: [submitted]
 
-# ① 顶层就授予“可写”权限（双保险）
+# 默认 + Job 里都给“可写”权限，确保能推分支、回评
 permissions:
   contents: write
   pull-requests: write
@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   claude:
+    # 只有带 @claude 才触发（Issue/PR 评审/标题或正文中出现）
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -27,7 +28,6 @@ jobs:
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
 
-    # ② job 级别再授一次（一些 Action 只读顶层，有的读 job 层）
     permissions:
       contents: write
       pull-requests: write
@@ -36,19 +36,21 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout repository (use PAT so we can push)
+      # 1) Checkout（用 PAT，才能推分支）
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-            fetch-depth: 0
-            persist-credentials: true
-            token: ${{ secrets.GH_PAT }}   # 你创建的 classic PAT（勾选 repo 全部）
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GH_PAT }}
 
+      # 2) 配置 git 身份（谁来提交）
       - name: Configure git user
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # ③ 先验证 Anthropic key（必须 200 再继续）
+      # 3) 先验 Key 是否可用（必须 200 才继续）
       - name: Verify Anthropic API key works
         env:
           KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -62,90 +64,85 @@ jobs:
           echo "HTTP $CODE"
           test "$CODE" = "200"
 
-      # ④ 动态选择一个可用模型，并写入到环境变量 MODEL_TO_USE
-      - name: Choose available Anthropic model automatically
-        id: pick_model
+      # 3.5) 打印 Usage（仅调试，不影响失败/成功）
+      - name: Check Anthropic API Usage
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "Fetching usage info (best-effort)..."
+          curl -s https://api.anthropic.com/v1/usage \
+            -H "x-api-key: $KEY" \
+            -H "anthropic-version: 2023-06-01" \
+          | jq . || true
+
+      # 4) 自动选择可用模型（优先新版；若没有则回退到稳定老版）
+      - name: Choose available Anthropic model
+        id: choose_model
         env:
           KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -e
-          curl -s -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" \
-            https://api.anthropic.com/v1/models > models.json
+          echo "Querying /v1/models ..."
+          MODELS_JSON=$(curl -s https://api.anthropic.com/v1/models \
+            -H "x-api-key: $KEY" \
+            -H "anthropic-version: 2023-06-01")
 
-          # 备选优先级列表（从新到旧/从强到弱）
-          CANDIDATES=$(cat <<'EOF'
-          claude-3-7-sonnet-20250219
-          claude-3-7-sonnet-latest
-          claude-3-5-sonnet-20241022
-          claude-3-5-sonnet-latest
-          claude-3-opus-20240229
-          claude-3-sonnet-20240229
-          claude-3-haiku-20240307
-          EOF
+          # 你可以按需调整优先级列表；存在即用、否则继续回退
+          PREFER=(
+            "claude-4.1"                 # 如果你的账号已有 4.x，这里会命中
+            "claude-4-0"                 # 或其它 4.0 命名（示例占位）
+            "claude-3-7-sonnet"          # 新版 3.x（示例）
+            "claude-3-5-sonnet-20241022" # 常见较新 3.5 Sonnet（示例）
+            "claude-3-5-sonnet-20240620" # 经常可用的稳定回退
+            "claude-3-sonnet-20240229"
+            "claude-3-opus-20240229"
           )
-          PICK=""
-          for m in $CANDIDATES; do
-            if jq -er --arg M "$m" '.data[]?.id | select(.==$M)' models.json >/dev/null 2>&1; then
-              PICK="$m"
+
+          CHOSEN=""
+          for name in "${PREFER[@]}"; do
+            HIT=$(echo "$MODELS_JSON" | jq -r --arg n "$name" '
+              .data[]?.id | select(. == $n) | . // empty' | head -n 1 || true)
+            if [ -n "$HIT" ]; then
+              CHOSEN="$HIT"
               break
             fi
           done
 
-          if [ -z "$PICK" ]; then
-            echo "❌ No candidate model found in your account."
-            echo "Raw list:"
-            cat models.json
-            exit 1
+          # 如果以上都没命中，尝试拿列表里第一个 id 兜底
+          if [ -z "$CHOSEN" ]; then
+            CHOSEN=$(echo "$MODELS_JSON" | jq -r '.data[0].id // empty')
           fi
 
-          echo "✅ Picked model: $PICK"
-          echo "MODEL_TO_USE=$PICK" >> $GITHUB_ENV
+          # 最后仍然没有，就用最稳妥的回退
+          if [ -z "$CHOSEN" ]; then
+            CHOSEN="claude-3-5-sonnet-20240620"
+          fi
 
-      # ⑤ 运行 Claude Code
-      #    关键点：continue-on-error=true，让后面的兜底推送还能执行
+          echo "Picked model: $CHOSEN"
+          echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
+
+      # 5) 运行 Claude Code（这一步之前漏掉了！）
       - name: Run Claude Code
         id: claude
-        continue-on-error: true
         uses: anthropics/claude-code-action@beta
         with:
-          github_token:       ${{ secrets.GH_PAT }}               # 用 PAT 提权，确保可 push
-          anthropic_api_key:  ${{ secrets.ANTHROPIC_API_KEY }}
-          model:              ${{ env.MODEL_TO_USE }}             # 用上一步挑选的可用模型
+          # 用可写 PAT，确保能创建分支/推送/回评
+          github_token: ${{ secrets.GH_PAT }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          # 显式传入我们挑选的可用模型；如果你强制用 4.0，可改成固定值
+          model: ${{ steps.choose_model.outputs.model }}
+
+          # 让它能读取 CI 状态做评审
           additional_permissions: |
             actions: read
+
+          # 触发短语（与 if 条件一致）
           trigger_phrase: "@claude"
-          label_trigger: "claude"
-          branch_prefix: "claude/"
-          mode: "tag"   # 保持默认行为即可（有需要再改）
 
-      # ⑥ 兜底：如果当前在 claude/* 分支，且远端还没有，就推上去
-      - name: Push branch if created (fallback)
-        if: always()
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          set -e
-          echo "::group::Git debug info"
-          git --version
-          git remote -v
-          git status
-          CUR=$(git rev-parse --abbrev-ref HEAD)
-          echo "Current branch: $CUR"
-          echo "::endgroup::"
-
-          # 只处理 claude/* 分支
-          if [[ "$CUR" != claude/* ]]; then
-            echo "Not on a claude/* branch, skip fallback push."
-            exit 0
-          fi
-
-          # 确认远端是否存在该分支（存在则跳过）
-          if git ls-remote --exit-code --heads origin "$CUR" >/dev/null 2>&1; then
-            echo "Remote branch already exists: origin/$CUR (skip)"
-            exit 0
-          fi
-
-          echo "Remote branch not found, try pushing..."
-          # 这里使用 checkout 时注入的 PAT 凭据，无需再改 remote
-          git push -u origin "$CUR"
-          echo "✅ Fallback push done."
+          # 其它可选项：
+          # use_sticky_comment: true
+          # label_trigger: "claude"
+          # branch_prefix: "claude/"
+          # max_turns: "8"
+          # timeout_minutes: "30"
