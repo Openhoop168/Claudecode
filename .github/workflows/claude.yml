@@ -72,4 +72,14 @@ jobs:
             -H "anthropic-version: 2023-06-01" \
             | jq .
 
-      # 4) 运行 Claude Co
+      # 4) 运行 Claude Code
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          github_token: ${{ secrets.GH_PAT }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 自动选择模型（避免写死不可用的）
+          model: claude-3-5-sonnet-latest
+          additional_permissions: |
+            actions: read
