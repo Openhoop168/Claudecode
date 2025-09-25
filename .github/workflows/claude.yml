@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   claude:
-    # 触发条件：含 @claude 的评论 / review 评论 / PR review / issue 标题或正文
+    # 含 @claude 的评论 / review 评论 / PR review / issue 标题或正文
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -37,19 +37,7 @@ jobs:
       id-token: write
 
     steps:
-      # 0)（可选）检查 Secret 是否存在 —— 只检查“是否为空”，不打印内容
-      - name: Sanity check secrets
-        run: |
-          if [ -z "${ANTHROPIC_API_KEY}" ]; then
-            echo "ERROR: ANTHROPIC_API_KEY is empty/missing"
-            exit 1
-          else
-            echo "ANTHROPIC_API_KEY is present"
-          fi
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
-      # 1) 用 PAT 检出（保证 git 有写权限）
+      # 1) 用 PAT 检出代码，确保后续能创建分支、提交、推送
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -57,33 +45,33 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GH_PAT }}
 
-      # 2) 设定 git 身份（用于后续提交）
+      # 2) 配置 git 身份
       - name: Configure git user
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # 3) 运行 Claude Code（显式指定模型；用 PAT 作为 GitHub token；用 ANTHROPIC_API_KEY 调用官方 API）
+      # 3) 先验证 Anthropic API Key 是否可用（必须返回 HTTP 200 才继续）
+      - name: Verify Anthropic API key works
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -e
+          echo "Pinging Anthropic /v1/models ..."
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "x-api-key: $KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            https://api.anthropic.com/v1/models)
+          echo "HTTP $CODE"
+          test "$CODE" = "200"
 
-        - name: Verify Anthropic API key works
-    env:
-      KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-    run: |
-      set -e
-      echo "Pinging Anthropic /v1/models ..."
-      CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-        -H "x-api-key: $KEY" \
-        -H "anthropic-version: 2023-06-01" \
-        https://api.anthropic.com/v1/models)
-      echo "HTTP $CODE"
-      test "$CODE" = "200"
-      
+      # 4) 运行 Claude Code（显式指定模型；使用 GH_PAT 和 ANTHROPIC_API_KEY）
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@beta   # 若仍异常可临时改为 @main 测试
+        uses: anthropics/claude-code-action@beta
         with:
           github_token: ${{ secrets.GH_PAT }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: "claude-3-5-sonnet-20240620"  # 显式指定一个稳定可用的模型
+          model: "claude-3-5-sonnet-20240620"
           additional_permissions: |
             actions: read
