@@ -1,4 +1,4 @@
-name: Claude Code
+name: Claude Code (Zhipu Gateway Compatible)
 
 on:
   issue_comment:
@@ -10,7 +10,7 @@ on:
   pull_request_review:
     types: [submitted]
 
-# 顶层给写权限（双保险）
+# 顶层：给到可写权限（双保险）
 permissions:
   contents: write
   pull-requests: write
@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   claude:
+    # 仅当正文里@claude时才触发
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -27,6 +28,7 @@ jobs:
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
 
+    # job 级别再授一次（有的 Action 只读这里）
     permissions:
       contents: write
       pull-requests: write
@@ -35,13 +37,12 @@ jobs:
       id-token: write
 
     env:
-      # 可选：如果你想显式指定 API Base，就在仓库 Secrets 里设置 ANTHROPIC_BASE_URL
-      # - 留空/未设置：按官方 Anthropic API 处理
-      # - 如果包含 "bigmodel.cn"：识别为智谱网关
-      BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      # ←—— 关键：把 Anthropic API 的基址重定向到智谱网关
+      ANTHROPIC_API_URL:  https://open.bigmodel.cn/api/anthropic
+      ANTHROPIC_BASE_URL: https://open.bigmodel.cn/api/anthropic
 
     steps:
-      # 1) Checkout（用 PAT，才能推分支）
+      # 1) 用 PAT 检出仓库（可推分支）
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -49,41 +50,17 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.GH_PAT }}
 
-      # 2) 配置 git 身份（提交记录里显示谁）
+      # 2) 配置 git 身份
       - name: Configure git user
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # 3) 识别提供方（Anthropic 官方 or 智谱网关）
-      - name: Detect provider (Anthropic vs Zhipu)
-        id: detect
-        shell: bash
-        run: |
-          set -e
-          BASE="${BASE_URL}"
-          if [[ -z "$BASE" ]]; then
-            echo "No BASE_URL provided; assume Anthropic official."
-            echo "provider=anthropic" >> "$GITHUB_OUTPUT"
-            echo "base=https://api.anthropic.com" >> "$GITHUB_OUTPUT"
-          else
-            L=$(echo "$BASE" | tr '[:upper:]' '[:lower:]')
-            if [[ "$L" == *"bigmodel.cn"* ]]; then
-              echo "Detected Zhipu (BigModel) gateway."
-              echo "provider=zhipu" >> "$GITHUB_OUTPUT"
-              echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-            else
-              echo "Custom base (non-zhipu); treat as Anthropic compatible."
-              echo "provider=anthropic" >> "$GITHUB_OUTPUT"
-              echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
-      # 4) 用识别出的 base /v1/models 探活（200 才继续）
-      - name: Verify API key against selected base
+      # 3) 探活：对智谱网关的 /v1/models 做 200 校验
+      - name: Verify API key against Zhipu gateway
         env:
-          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          BASE: ${{ steps.detect.outputs.base }}
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # 这里放智谱的 Key
+          BASE: ${{ env.ANTHROPIC_API_URL }}
         run: |
           set -e
           echo "Pinging $BASE/v1/models ..."
@@ -94,122 +71,94 @@ jobs:
           echo "HTTP $CODE"
           test "$CODE" = "200"
 
-      # 5) 打印模型列表（方便排查）
+      # 3.5) Dump 模型（便于排错）
       - name: Dump models (debug)
         env:
-          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          BASE: ${{ steps.detect.outputs.base }}
+          KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          BASE: ${{ env.ANTHROPIC_API_URL }}
         run: |
+          set -e
           curl -s "$BASE/v1/models" \
             -H "x-api-key: $KEY" \
             -H "anthropic-version: 2023-06-01" | jq .
 
-      # 6) 选模型：Anthropic 选 claude-*, 智谱选 glm-*
-      - name: Choose available model
+      # 4) 从网关返回里选择可用模型（先 glm-4.5-air，再 glm-4.5）
+      - name: Choose available model (glm-4.5[-air])
         id: choose_model
         env:
-          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          BASE: ${{ steps.detect.outputs.base }}
-          PROVIDER: ${{ steps.detect.outputs.provider }}
+          KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          BASE: ${{ env.ANTHROPIC_API_URL }}
         run: |
           set -e
           MODELS=$(curl -s "$BASE/v1/models" \
             -H "x-api-key: $KEY" \
             -H "anthropic-version: 2023-06-01")
 
-          if [[ "$PROVIDER" == "zhipu" ]]; then
-            # 智谱网关返回 glm 系列；优先更强的
-            PREFER=("glm-4.5" "glm-4.5-Air" "glm-4" "glm-3-turbo")
-          else
-            # Anthropic 官方模型（按可用度/稳定性回退）
-            PREFER=("claude-3-7-sonnet-20250219" "claude-3-7-sonnet-latest" "claude-3-5-sonnet-20241022" "claude-3-5-sonnet-20240620" "claude-3-sonnet-20240229" "claude-3-opus-20240229")
-          fi
+          pick() {
+            echo "$MODELS" | jq -er --arg m "$1" '.data[]?.id | select(.==$m)' >/dev/null 2>&1
+          }
 
           CHOSEN=""
-          for name in "${PREFER[@]}"; do
-            HIT=$(echo "$MODELS" | jq -r --arg n "$name" '.data[]?.id | select(. == $n) | . // empty' | head -n 1 || true)
-            if [[ -n "$HIT" ]]; then
-              CHOSEN="$HIT"
-              break
-            fi
-          done
+          if pick "glm-4.5-air"; then
+            CHOSEN="glm-4.5-air"
+          elif pick "glm-4.5"; then
+            CHOSEN="glm-4.5"
+          fi
 
-          if [[ -z "$CHOSEN" ]]; then
-            # 列表第一个兜底
+          if [ -z "$CHOSEN" ]; then
+            # 没命中以上两种，就兜底拿第一个
             CHOSEN=$(echo "$MODELS" | jq -r '.data[0].id // empty')
           fi
 
-          if [[ -z "$CHOSEN" ]]; then
-            echo "❌ No model id found from $BASE/v1/models"
+          if [ -z "$CHOSEN" ]; then
+            echo "❌ No model available from Zhipu gateway list"
             exit 1
           fi
 
           echo "Picked model: $CHOSEN"
           echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
 
-      # 7) 如果是智谱网关：跳过运行，并自动回一条解释性评论（不会失败）
-      - name: Explain unsupported gateway (Zhipu)
-        if: ${{ steps.detect.outputs.provider == 'zhipu' }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GH_PAT }}
-          script: |
-            const body = `
-**Claude Code 未执行**
-- 检测到你当前使用的是 **智谱 BigModel 网关**（\`${{ steps.detect.outputs.base }}\`）。
-- 官方 GitHub Action \`anthropics/claude-code-action\` **只支持 Anthropic 官方 API**，不能使用第三方网关 Key。
-- 解决办法：
-  1. 去 Anthropic Console 生成 **官方 API Key**（前缀 \`sk-ant-\`），并在仓库 Secrets 里设置 \`ANTHROPIC_API_KEY\`；
-  2. （可选）删除 \`ANTHROPIC_BASE_URL\`，或把它改成 \`https://api.anthropic.com\`；
-  3. 然后在 Issue/PR 里再评论 \`@claude ...\` 触发即可。
-
-> 你目前的模型列表已经正常返回（如 \`${{ steps.choose_model.outputs.model }}\`），说明网关 Key 可用，只是官方 Action 不支持网关调用。`;
-            const payload = context.payload;
-            if (payload.issue) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: payload.issue.number,
-                body
-              });
-            } else if (payload.pull_request) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: payload.pull_request.number,
-                body
-              });
-            }
-            core.notice("Skipped running Claude Code because provider=zhipu (gateway not supported).")
-
-      # 8) 如果是 Anthropic 官方：真正运行 Claude Code
+      # 5) 运行 Claude Code（走智谱网关；模型用上一步选择）
       - name: Run Claude Code
-        if: ${{ steps.detect.outputs.provider == 'anthropic' }}
         id: claude
         uses: anthropics/claude-code-action@beta
+        env:
+          # 有些实现只认 env，不认 inputs，这里双保险
+          ANTHROPIC_API_URL:  ${{ env.ANTHROPIC_API_URL }}
+          ANTHROPIC_BASE_URL: ${{ env.ANTHROPIC_BASE_URL }}
         with:
-          github_token: ${{ secrets.GH_PAT }}                 # 用 PAT 才能推分支/回评
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # 官方 key（前缀 sk-ant-）
-          model: ${{ steps.choose_model.outputs.model }}
+          github_token:      ${{ secrets.GH_PAT }}               # 必须用 PAT 才能推分支/回评
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}    # 智谱的 Key
+          model:             ${{ steps.choose_model.outputs.model }}
+
+          # 允许读取当前工作流运行的状态（用于评审）
           additional_permissions: |
             actions: read
-          trigger_phrase: "@claude"
-          branch_prefix: "claude/"
-          mode: "tag"
 
-      # 9) 兜底推分支（仅官方模式下有意义）
-      - name: Push branch if created (fallback)
-        if: ${{ always() && steps.detect.outputs.provider == 'anthropic' }}
+          # 与 if 条件一致的触发短语
+          trigger_phrase: "@claude"
+
+          # 你也可以按需加：
+          # branch_prefix: "claude/"
+          # max_turns: "8"
+          # timeout_minutes: "30"
+          # use_sticky_comment: true
+
+      # 6) 兜底：如果已经在 claude/* 分支且远端还没有，就尝试推上去
+      - name: Fallback push created branch
+        if: always()
         run: |
           set -e
-          CUR=$(git rev-parse --abbrev-ref HEAD)
+          CUR=$(git rev-parse --abbrev-ref HEAD || echo "")
           echo "Current branch: $CUR"
           if [[ "$CUR" == claude/* ]]; then
             if git ls-remote --exit-code --heads origin "$CUR" >/dev/null 2>&1; then
-              echo "Remote branch already exists: origin/$CUR"
+              echo "Remote already has $CUR, skip."
             else
-              echo "Pushing branch: $CUR"
+              echo "Pushing $CUR to origin..."
               git push -u origin "$CUR"
+              echo "✅ Fallback push done."
             fi
           else
-            echo "Not on a claude/* branch; nothing to push."
+            echo "Not on a claude/* branch, skip fallback."
+          fi
